@@ -151,3 +151,19 @@ def test_investigation_handles_empty_answer(monkeypatch):
 
     with pytest.raises(RuntimeError, match="empty or invalid investigation"):
         investigate_incident(sample_incident())
+
+def test_investigation_handles_retrieval_failure():
+    from src.investigation import investigate_incident
+
+    class FailingRetriever:
+        def search(self, query, top_k=3):
+            raise RuntimeError("Could not connect to Ollama for embeddings.")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Could not connect to Ollama for embeddings",
+    ):
+        investigate_incident(
+            sample_incident(),
+            retriever=FailingRetriever(),
+        )

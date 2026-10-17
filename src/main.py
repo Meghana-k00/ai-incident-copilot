@@ -6,11 +6,13 @@ from fastapi import FastAPI, HTTPException
 from src.models import IncidentCreate, IncidentResponse, IncidentUpdate
 from src import database
 from src.investigation import investigate_incident
+from src.retrieval import IncidentRetriever
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
+    app.state.retriever = IncidentRetriever()
     yield
 
 
@@ -100,6 +102,7 @@ def delete_incident_endpoint(incident_id: int):
         "id": incident_id,
     }
 
+
 @app.post("/incidents/{incident_id}/investigate")
 def investigate_incident_endpoint(incident_id: int):
     incident = database.get_incident_by_id(incident_id)
@@ -109,13 +112,21 @@ def investigate_incident_endpoint(incident_id: int):
             status_code=404,
             detail="Incident not found",
         )
-
     try:
-        result = investigate_incident(incident)
-    except (ValueError, RuntimeError) as exc:
+        result = investigate_incident(
+            incident,
+            retriever=getattr(app.state, "retriever", None),
+        )
+    except ValueError as exc:
         raise HTTPException(
-            status_code=500,
+            status_code=422,
             detail=str(exc),
         ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
+
 
     return result

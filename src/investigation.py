@@ -1,15 +1,27 @@
+
 import json
 import urllib.error
 import urllib.request
 
-from typing import Any
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from src.retrieval import IncidentRetriever
+
+
+class InvestigationState(TypedDict, total=False):
+    incident: dict[str, Any]
+    model: str
+    retriever: IncidentRetriever | None
+    context: dict[str, Any]
+    retrieved_documents: list[dict[str, Any]]
+    investigation: str
+    result: dict[str, Any]
 
 
 def prepare_investigation(incident: dict[str, Any]) -> dict[str, Any]:
-    """
-    Prepare structured context for investigating an incident.
-    This function does not call an AI model or modify the database.
-    """
+    """Validate an incident and prepare structured investigation context."""
     title = str(incident.get("title", "")).strip()
     description = str(incident.get("description", "")).strip()
     severity = str(incident.get("severity", "unknown")).strip().lower()
@@ -40,29 +52,62 @@ def prepare_investigation(incident: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def investigate_incident(
-    incident: dict[str, Any],
-    model: str = "qwen2.5:3b",
-) -> dict[str, Any]:
-    """Generate AI investigation findings using local Ollama."""
+def prepare_incident_node(state: InvestigationState) -> dict[str, Any]:
+    """Graph node 1: validate and prepare the incident."""
+    return {
+        "context": prepare_investigation(state["incident"])
+    }
 
-    context = prepare_investigation(incident)
+
+def retrieve_knowledge_node(state: InvestigationState) -> dict[str, Any]:
+    """Graph node 2: retrieve relevant historical incident knowledge."""
+    retriever = state.get("retriever")
+    documents: list[dict[str, Any]] = []
+
+    if retriever is not None:
+        documents = retriever.search(
+            state["context"]["investigation_context"],
+            top_k=3,
+        )
+
+    return {"retrieved_documents": documents}
+
+
+def generate_investigation_node(
+    state: InvestigationState,
+) -> dict[str, Any]:
+    """Graph node 3: generate investigation findings using local Ollama."""
+    context = state["context"]
+    documents = state.get("retrieved_documents", [])
+    model = state.get("model", "qwen2.5:3b")
+
+    historical_knowledge = (
+        "\n\n".join(
+            f"Reference {index}:\n{document['text']}"
+            for index, document in enumerate(documents, start=1)
+        )
+        or "No relevant historical incident knowledge was retrieved."
+    )
 
     prompt = f"""
 You are an experienced site reliability engineer.
 Analyze the incident below.
 
-Incident:
+Current incident:
 {json.dumps(context, indent=2)}
 
-Provide:
-1. Three plausible root causes.
-2. Diagnostic checks to investigate them.
-3. Recommended remediation steps.
-4. A short explanation of your reasoning.
+Relevant historical knowledge retrieved from the knowledge base:
+{historical_knowledge}
 
-Do not claim that you have verified a cause.
-Return your findings as plain text.
+Instructions:
+1. Provide three plausible root causes.
+2. Recommend diagnostic checks for each likely cause.
+3. Suggest safe, actionable remediation steps.
+4. Explain your reasoning.
+5. Use historical knowledge only when relevant to the current incident.
+6. Distinguish historical information from facts about the current incident.
+7. Do not claim that a cause has been verified.
+8. Return your findings as plain text.
 """
 
     payload = json.dumps({
@@ -109,8 +154,57 @@ Return your findings as plain text.
             "Ollama returned an empty or invalid investigation."
         )
 
+    return {"investigation": answer.strip()}
+
+
+def finalize_investigation_node(
+    state: InvestigationState,
+) -> dict[str, Any]:
+    """Graph node 4: assemble the existing public response format."""
+    context = state["context"]
+
     return {
-        "incident_id": context["incident_id"],
-        "model": model,
-        "investigation": answer.strip(),
+        "result": {
+            "incident_id": context["incident_id"],
+            "model": state.get("model", "qwen2.5:3b"),
+            "investigation": state["investigation"],
+            "retrieved_documents": state.get("retrieved_documents", []),
+        }
     }
+
+
+def build_investigation_graph():
+    """Build and compile the incident investigation workflow."""
+    workflow = StateGraph(InvestigationState)
+
+    workflow.add_node("prepare_incident", prepare_incident_node)
+    workflow.add_node("retrieve_knowledge", retrieve_knowledge_node)
+    workflow.add_node("generate_investigation", generate_investigation_node)
+    workflow.add_node("finalize_investigation", finalize_investigation_node)
+
+    workflow.add_edge(START, "prepare_incident")
+    workflow.add_edge("prepare_incident", "retrieve_knowledge")
+    workflow.add_edge("retrieve_knowledge", "generate_investigation")
+    workflow.add_edge("generate_investigation", "finalize_investigation")
+    workflow.add_edge("finalize_investigation", END)
+
+    return workflow.compile()
+
+
+investigation_graph = build_investigation_graph()
+
+
+def investigate_incident(
+    incident: dict[str, Any],
+    model: str = "qwen2.5:3b",
+    retriever: IncidentRetriever | None = None,
+) -> dict[str, Any]:
+    """Run incident investigation through the compiled LangGraph workflow."""
+    state: InvestigationState = {
+        "incident": incident,
+        "model": model,
+        "retriever": retriever,
+    }
+
+    result = investigation_graph.invoke(state)
+    return result["result"]

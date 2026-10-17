@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 *.db
 *.sqlite3
+# Local application and vector database files
+data/incidents.db
+data/chroma_db/

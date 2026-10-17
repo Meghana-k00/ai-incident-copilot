@@ -197,7 +197,7 @@ def test_investigate_incident_success(client, monkeypatch):
         json=sample_incident(),
     ).json()
 
-    def fake_investigate(incident):
+    def fake_investigate(incident, retriever=None):
         return {
             "incident_id": incident["id"],
             "model": "qwen2.5:3b",
@@ -240,7 +240,7 @@ def test_investigation_runtime_error(client, monkeypatch):
         json=sample_incident(),
     ).json()
 
-    def fake_investigate(incident):
+    def fake_investigate(incident, retriever=None):
         raise RuntimeError("Ollama is unavailable")
 
     monkeypatch.setattr(
@@ -252,5 +252,5 @@ def test_investigation_runtime_error(client, monkeypatch):
         f"/incidents/{created['id']}/investigate"
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 503
     assert response.json()["detail"] == "Ollama is unavailable"
