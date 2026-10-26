@@ -254,3 +254,91 @@ def test_investigation_runtime_error(client, monkeypatch):
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Ollama is unavailable"
+
+def test_create_approval_request_and_audit(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        incident_id=created["id"],
+        proposed_action="Restart the database service",
+        workflow_thread_id="incident-1",
+    )
+
+    assert approval is not None
+    assert approval["status"] == "pending"
+    assert approval["incident_id"] == created["id"]
+
+    events = database.get_approval_audit_log(approval["id"])
+    assert len(events) == 1
+    assert events[0]["event_type"] == "created"
+
+
+def test_approve_request_records_reviewer_and_audit(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"], "Check database connection pool"
+    )
+
+    decided = database.decide_approval_request(
+        approval["id"],
+        "approved",
+        "reviewer-1",
+        "Approved after checking the runbook.",
+    )
+
+    assert decided["status"] == "approved"
+    assert decided["reviewer_id"] == "reviewer-1"
+    assert decided["decided_at"] is not None
+
+    events = database.get_approval_audit_log(approval["id"])
+    assert [event["event_type"] for event in events] == [
+        "created", "approved"
+    ]
+
+
+def test_cannot_decide_approval_request_twice(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"], "Review database connectivity"
+    )
+
+    first = database.decide_approval_request(
+        approval["id"], "approved", "reviewer-1"
+    )
+    second = database.decide_approval_request(
+        approval["id"], "rejected", "reviewer-2"
+    )
+
+    assert first["status"] == "approved"
+    assert second is None
+
+
+def test_invalid_approval_decision_is_rejected(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"], "Review database connectivity"
+    )
+
+    with pytest.raises(ValueError):
+        database.decide_approval_request(
+            approval["id"], "maybe", "reviewer-1"
+        )
+
+
+def test_approval_for_missing_incident_returns_none(client):
+    approval = database.create_approval_request(
+        999, "Restart the service"
+    )
+
+    assert approval is None

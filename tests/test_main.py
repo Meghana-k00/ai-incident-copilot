@@ -102,3 +102,27 @@ def test_investigate_returns_503_when_ollama_is_unavailable():
         response = client.post("/incidents/1/investigate")
 
     assert response.status_code == 503
+
+def test_pending_approvals_requires_authentication():
+    with TestClient(app) as client:
+        response = client.get("/approvals/pending")
+        assert response.status_code == 503
+
+
+def test_get_approval_requires_authentication():
+    with TestClient(app) as client:
+        response = client.get("/approvals/1")
+        assert response.status_code == 503
+
+
+def test_decision_requires_authentication():
+    with TestClient(app) as client:
+        response = client.post(
+            "/approvals/1/decision",
+            json={
+                "decision": "approved",
+                "decision_note": "",
+            },
+        )
+        assert response.status_code == 503
+
