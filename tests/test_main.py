@@ -607,3 +607,40 @@ def test_retry_recovers_after_workflow_state_save_failure(monkeypatch):
         reviewer_id="reviewer-test",
         decision_note="Test",
     )
+
+def test_retry_after_finalized_approval_does_not_resume_again(
+    monkeypatch,
+):
+    approval = {
+        "id": 1,
+        "status": "approved",
+        "workflow_thread_id": "test-thread",
+    }
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "APPROVAL_API_TOKEN": "test-token",
+                "APPROVAL_REVIEWER_ID": "reviewer-test",
+                "APPROVAL_REVIEWER_ROLE": "reviewer",
+            },
+        ),
+        patch(
+            "src.main.database.get_approval_request",
+            return_value=approval,
+        ),
+        patch("src.main.resume_approval") as resume_mock,
+        TestClient(app) as test_client,
+    ):
+        response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "decision": "approved",
+                "decision_note": "Test",
+            },
+        )
+
+    assert response.status_code == 409
+    resume_mock.assert_not_called()
