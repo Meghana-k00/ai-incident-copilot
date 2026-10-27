@@ -143,3 +143,27 @@ def test_completed_workflow_cannot_be_resumed_again():
         assert second_result.get("decision") != "rejected", (
             "A completed approval workflow accepted a second decision."
         )
+
+
+def test_completed_approval_decision_reads_real_checkpoint():
+    from src.approval_workflow import get_completed_approval_decision
+
+    with SqliteSaver.from_conn_string(":memory:") as checkpointer:
+        graph = build_approval_graph(checkpointer)
+        thread_id = "completed-checkpoint-test"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        graph.invoke(
+            {
+                "approval_id": 501,
+                "proposed_action": "Restart the test service",
+                "decision": "",
+            },
+            config=config,
+        )
+
+        resume_approval(graph, thread_id, "approved")
+
+        result = get_completed_approval_decision(graph, thread_id)
+
+        assert result == "approved"

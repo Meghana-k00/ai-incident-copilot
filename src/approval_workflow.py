@@ -48,3 +48,21 @@ def resume_approval(
         Command(resume=decision),
         config={"configurable": {"thread_id": thread_id}},
     )
+
+def get_completed_approval_decision(
+    graph,
+    thread_id: str,
+) -> str | None:
+    """Return the saved decision only if this workflow has completed."""
+    snapshot = graph.get_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+
+    if snapshot is None or snapshot.next:
+        return None
+
+    decision = snapshot.values.get("decision")
+    if decision in {"approved", "rejected", "changes_requested"}:
+        return decision
+
+    return None
