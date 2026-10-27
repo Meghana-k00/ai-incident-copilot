@@ -1,7 +1,6 @@
 
-from pydantic import BaseModel, Field
 from typing import Literal
-
+from pydantic import BaseModel, Field, ConfigDict
 
 class IncidentCreate(BaseModel):
     title: str = Field(..., min_length=5, max_length=200)
@@ -17,8 +16,6 @@ class IncidentResponse(IncidentCreate):
 class IncidentUpdate(BaseModel):
     status: Literal["open", "investigating", "resolved", "closed"]
 
-from typing import Literal
-from pydantic import BaseModel, Field
 
 
 class ApprovalDecision(BaseModel):
@@ -26,7 +23,7 @@ class ApprovalDecision(BaseModel):
     decision_note: str = Field(default="", max_length=2000)
 
 
-from pydantic import BaseModel, Field, ConfigDict
+
 
 
 class ApprovalRequestCreate(BaseModel):

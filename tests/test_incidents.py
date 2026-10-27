@@ -342,3 +342,39 @@ def test_approval_for_missing_incident_returns_none(client):
     )
 
     assert approval is None
+
+@pytest.mark.parametrize(
+    "decision",
+    ["rejected", "changes_requested"],
+)
+def test_non_approval_decisions_are_recorded_in_audit(
+    client, decision
+):
+    created = client.post(
+        "/incidents",
+        json=sample_incident(),
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"],
+        "Restart the database service",
+    )
+
+    decided = database.decide_approval_request(
+        approval["id"],
+        decision,
+        "reviewer-1",
+        "Decision recorded for testing.",
+    )
+
+    assert decided["status"] == decision
+    assert decided["reviewer_id"] == "reviewer-1"
+
+    events = database.get_approval_audit_log(approval["id"])
+
+    assert [event["event_type"] for event in events] == [
+        "created",
+        decision,
+    ]
+    assert events[1]["actor_id"] == "reviewer-1"
+    assert events[1]["details"] == "Decision recorded for testing."
