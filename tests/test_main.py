@@ -126,3 +126,96 @@ def test_decision_requires_authentication():
         )
         assert response.status_code == 503
 
+
+def test_decision_resume_failure_leaves_approval_pending():
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+
+    approval = {
+        "id": 1,
+        "status": "pending",
+        "workflow_thread_id": "test-thread",
+    }
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "APPROVAL_API_TOKEN": "test-token",
+                "APPROVAL_REVIEWER_ID": "reviewer-test",
+                "APPROVAL_REVIEWER_ROLE": "reviewer",
+            },
+        ),
+        patch(
+            "src.main.database.get_approval_request",
+            return_value=approval,
+        ),
+        patch(
+            "src.main.resume_approval",
+            side_effect=RuntimeError("Simulated workflow failure"),
+        ) as resume_mock,
+        patch(
+            "src.main.database.decide_approval_request"
+        ) as decide_mock,
+        TestClient(app) as test_client,
+    ):
+        response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "decision": "approved",
+                "decision_note": "Test",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Could not resume the approval workflow."
+    )
+    resume_mock.assert_called_once()
+    decide_mock.assert_not_called()
+    assert approval["status"] == "pending"
+
+
+def test_decision_database_update_failure_is_not_hidden():
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    approval = {
+        "id": 1,
+        "status": "pending",
+        "workflow_thread_id": "test-thread",
+    }
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "APPROVAL_API_TOKEN": "test-token",
+                "APPROVAL_REVIEWER_ID": "reviewer-test",
+                "APPROVAL_REVIEWER_ROLE": "reviewer",
+            },
+        ),
+        patch("src.main.database.get_approval_request", return_value=approval),
+        patch(
+            "src.main.resume_approval",
+            return_value={"decision": "approved"},
+        ),
+        patch(
+            "src.main.database.decide_approval_request",
+            return_value=None,
+        ),
+        TestClient(app) as test_client,
+    ):
+        response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={"decision": "approved", "decision_note": "Test"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Approval request could not be updated."
+    )
+
