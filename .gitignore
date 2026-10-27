@@ -9,3 +9,11 @@ __pycache__/
 # Local application and vector database files
 data/incidents.db
 data/chroma_db/
+# Local SQLite databases and workflow checkpoints
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/
+# Virtual environments and Python caches
+.venv/
+__pycache__/

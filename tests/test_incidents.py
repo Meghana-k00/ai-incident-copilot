@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from src.main import app
 from src import database
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -254,3 +256,240 @@ def test_investigation_runtime_error(client, monkeypatch):
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Ollama is unavailable"
+
+def test_create_approval_request_and_audit(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        incident_id=created["id"],
+        proposed_action="Restart the database service",
+        workflow_thread_id="incident-1",
+    )
+
+    assert approval is not None
+    assert approval["status"] == "pending"
+    assert approval["incident_id"] == created["id"]
+
+    events = database.get_approval_audit_log(approval["id"])
+    assert len(events) == 1
+    assert events[0]["event_type"] == "created"
+
+
+def test_approve_request_records_reviewer_and_audit(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"], "Check database connection pool"
+    )
+
+    decided = database.decide_approval_request(
+        approval["id"],
+        "approved",
+        "reviewer-1",
+        "Approved after checking the runbook.",
+    )
+
+    assert decided["status"] == "approved"
+    assert decided["reviewer_id"] == "reviewer-1"
+    assert decided["decided_at"] is not None
+
+    events = database.get_approval_audit_log(approval["id"])
+    assert [event["event_type"] for event in events] == [
+        "created", "approved"
+    ]
+
+
+def test_cannot_decide_approval_request_twice(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"], "Review database connectivity"
+    )
+
+    first = database.decide_approval_request(
+        approval["id"], "approved", "reviewer-1"
+    )
+    second = database.decide_approval_request(
+        approval["id"], "rejected", "reviewer-2"
+    )
+
+    assert first["status"] == "approved"
+    assert second is None
+
+    events = database.get_approval_audit_log(approval["id"])
+
+    assert [event["event_type"] for event in events] == [
+        "created",
+        "approved",
+    ]
+
+
+def test_invalid_approval_decision_is_rejected(client):
+    created = client.post(
+        "/incidents", json=sample_incident()
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"], "Review database connectivity"
+    )
+
+    with pytest.raises(ValueError):
+        database.decide_approval_request(
+            approval["id"], "maybe", "reviewer-1"
+        )
+
+
+def test_approval_for_missing_incident_returns_none(client):
+    approval = database.create_approval_request(
+        999, "Restart the service"
+    )
+
+    assert approval is None
+
+@pytest.mark.parametrize(
+    "decision",
+    ["rejected", "changes_requested"],
+)
+def test_non_approval_decisions_are_recorded_in_audit(
+    client, decision
+):
+    created = client.post(
+        "/incidents",
+        json=sample_incident(),
+    ).json()
+
+    approval = database.create_approval_request(
+        created["id"],
+        "Restart the database service",
+    )
+
+    decided = database.decide_approval_request(
+        approval["id"],
+        decision,
+        "reviewer-1",
+        "Decision recorded for testing.",
+    )
+
+    assert decided["status"] == decision
+    assert decided["reviewer_id"] == "reviewer-1"
+
+    events = database.get_approval_audit_log(approval["id"])
+
+    assert [event["event_type"] for event in events] == [
+        "created",
+        decision,
+    ]
+    assert events[1]["actor_id"] == "reviewer-1"
+    assert events[1]["details"] == "Decision recorded for testing."
+
+
+def _prepare_claim_test_database(tmp_path, monkeypatch):
+    from src import database
+
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claim_test.sqlite")
+    database.init_db()
+    incident = database.create_incident(
+        title="Claim test incident",
+        description="An incident created for decision claim tests.",
+        severity="high",
+        service_name="claim-test",
+    )
+    approval = database.create_approval_request(
+        incident_id=incident["id"],
+        proposed_action="Restart the test service",
+        workflow_thread_id="claim-test-thread",
+    )
+    return database, approval
+
+
+def test_claim_approval_decision_creates_claim_and_keeps_pending(tmp_path, monkeypatch):
+    database, approval = _prepare_claim_test_database(tmp_path, monkeypatch)
+    result = database.claim_approval_decision(
+        approval["id"], "approved", "reviewer-1", "Approved."
+    )
+    assert result["outcome"] == "created"
+    assert result["claim"]["decision"] == "approved"
+    assert result["claim"]["reviewer_id"] == "reviewer-1"
+    assert database.get_approval_request(approval["id"])["status"] == "pending"
+
+
+def test_claim_approval_decision_same_request_is_idempotent(tmp_path, monkeypatch):
+    database, approval = _prepare_claim_test_database(tmp_path, monkeypatch)
+    args = (approval["id"], "approved", "reviewer-1", "Approved.")
+    assert database.claim_approval_decision(*args)["outcome"] == "created"
+    assert database.claim_approval_decision(*args)["outcome"] == "existing"
+
+
+def test_claim_approval_decision_conflict_preserves_first_claim(tmp_path, monkeypatch):
+    database, approval = _prepare_claim_test_database(tmp_path, monkeypatch)
+    database.claim_approval_decision(
+        approval["id"], "approved", "reviewer-1", "Approved."
+    )
+    result = database.claim_approval_decision(
+        approval["id"], "rejected", "reviewer-2", "Rejected."
+    )
+    assert result["outcome"] == "conflict"
+    assert result["claim"]["decision"] == "approved"
+    assert result["claim"]["reviewer_id"] == "reviewer-1"
+
+
+def test_claim_approval_decision_missing_approval(tmp_path, monkeypatch):
+    from src import database
+
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claim_test.sqlite")
+    database.init_db()
+    assert database.claim_approval_decision(
+        999999, "approved", "reviewer-1"
+    ) == {"outcome": "missing", "claim": None}
+def test_concurrent_approval_decisions_allow_only_one_claim(
+    tmp_path, monkeypatch
+):
+    database, approval = _prepare_claim_test_database(
+        tmp_path, monkeypatch
+    )
+    barrier = Barrier(2)
+
+    def submit_claim(decision, reviewer):
+        barrier.wait()
+        return database.claim_approval_decision(
+            approval["id"],
+            decision,
+            reviewer,
+            f"{decision} note",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            submit_claim, "approved", "reviewer-1"
+        )
+        second = executor.submit(
+            submit_claim, "rejected", "reviewer-2"
+        )
+
+        results = [first.result(), second.result()]
+
+    outcomes = sorted(result["outcome"] for result in results)
+
+    assert outcomes == ["conflict", "created"]
+
+    saved_claim = database.claim_approval_decision(
+        approval["id"],
+        "approved",
+        "reviewer-1",
+        "approved note",
+    )
+    assert saved_claim["outcome"] in {"existing", "conflict"}
+
+    claims = [
+        result["claim"]
+        for result in results
+        if result["outcome"] == "created"
+    ]
+    assert len(claims) == 1
+    assert database.get_approval_request(approval["id"])["status"] == "pending"

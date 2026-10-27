@@ -1,7 +1,6 @@
 
-from pydantic import BaseModel, Field
 from typing import Literal
-
+from pydantic import BaseModel, Field, ConfigDict
 
 class IncidentCreate(BaseModel):
     title: str = Field(..., min_length=5, max_length=200)
@@ -16,3 +15,22 @@ class IncidentResponse(IncidentCreate):
 
 class IncidentUpdate(BaseModel):
     status: Literal["open", "investigating", "resolved", "closed"]
+
+
+
+class ApprovalDecision(BaseModel):
+    decision: Literal["approved", "rejected", "changes_requested"]
+    decision_note: str = Field(default="", max_length=2000)
+
+
+
+
+
+class ApprovalRequestCreate(BaseModel):
+    proposed_action: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="The proposed action that requires human approval.",
+    )
+
+    model_config = ConfigDict(str_strip_whitespace=True)

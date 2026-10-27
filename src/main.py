@@ -7,13 +7,35 @@ from src.models import IncidentCreate, IncidentResponse, IncidentUpdate
 from src import database
 from src.investigation import investigate_incident
 from src.retrieval import IncidentRetriever
+from fastapi import Depends, HTTPException
+from src.auth import require_reviewer
+from src.models import ApprovalDecision
+import os
+from langgraph.checkpoint.sqlite import SqliteSaver
+from src.approval_workflow import build_approval_graph
+import uuid
+from src.models import ApprovalRequestCreate
+
+from src.approval_workflow import resume_approval
+from src.approval_workflow import get_completed_approval_decision
+
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
     app.state.retriever = IncidentRetriever()
-    yield
+
+    checkpoint_db = os.getenv(
+        "APPROVAL_CHECKPOINT_DB",
+        str(database.DATA_DIR / "approval_checkpoints.sqlite"),
+    )
+
+    with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
+        checkpointer.setup()
+        app.state.approval_graph = build_approval_graph(checkpointer)
+        yield
+
 
 
 app = FastAPI(
@@ -130,3 +152,273 @@ def investigate_incident_endpoint(incident_id: int):
 
 
     return result
+
+@app.get("/approvals/pending")
+def read_pending_approvals(
+    reviewer: dict = Depends(require_reviewer),
+):
+    return database.list_pending_approvals()
+
+
+
+@app.get("/approvals/{approval_id}")
+def read_approval(
+    approval_id: int,
+    reviewer: dict = Depends(require_reviewer),
+):
+    approval = database.get_approval_request(approval_id)
+
+    if approval is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found.",
+        )
+
+    return approval
+
+
+
+
+@app.post("/approvals/{approval_id}/decision")
+def submit_approval_decision(
+    approval_id: int,
+    decision: ApprovalDecision,
+    reviewer: dict = Depends(require_reviewer),
+):
+    approval = database.get_approval_request(approval_id)
+
+    if approval is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found.",
+        )
+
+    if approval["status"] != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="This approval request has already been decided.",
+        )
+
+    thread_id = approval.get("workflow_thread_id")
+    if not thread_id:
+        raise HTTPException(
+            status_code=409,
+            detail="This approval request is not linked to a workflow.",
+        )
+
+    # Claim the decision atomically before resuming the workflow.
+    try:
+        claim_result = database.claim_approval_decision(
+            approval_id=approval_id,
+            decision=decision.decision,
+            reviewer_id=reviewer["reviewer_id"],
+            decision_note=decision.decision_note,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not claim the approval decision.",
+        ) from exc
+
+    outcome = claim_result["outcome"]
+    claim = claim_result["claim"]
+
+    if outcome == "missing":
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found.",
+        )
+
+    if outcome == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A different decision has already been claimed "
+                "for this approval, or the approval is no longer pending."
+            ),
+        )
+
+    if outcome not in {"created", "existing"} or claim is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected approval decision claim result.",
+        )
+
+    workflow_result = None
+
+    if claim["state"] == "claimed":
+        try:
+            lease_result = database.acquire_approval_resume_lease(
+                approval_id=approval_id,
+                lease_seconds=300,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Could not acquire the workflow resume lease.",
+            ) from exc
+
+        if lease_result["outcome"] == "busy":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another request is processing this approval. "
+                    "Retry the same decision shortly."
+                ),
+            )
+
+        if lease_result["outcome"] != "acquired":
+            raise HTTPException(
+                status_code=409,
+                detail="The approval workflow is not available for resumption.",
+            )
+
+        lease_owner = lease_result["owner"]
+
+        try:
+            try:
+                completed_decision = get_completed_approval_decision(
+                    app.state.approval_graph,
+                    thread_id,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not inspect the approval workflow checkpoint.",
+                ) from exc
+
+            if completed_decision is not None:
+                if completed_decision != claim["decision"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The workflow checkpoint contains a different "
+                            "decision. Manual reconciliation is required."
+                        ),
+                    )
+
+                workflow_result = {"decision": completed_decision}
+
+            else:
+                try:
+                    workflow_result = resume_approval(
+                        app.state.approval_graph,
+                        thread_id,
+                        claim["decision"],
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Could not resume the approval workflow. "
+                            "Retry using the same decision and review details."
+                        ),
+                    ) from exc
+
+            try:
+                claim = database.mark_approval_workflow_resumed(
+                    approval_id,
+                    lease_owner,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "The workflow resumed, but its completion state "
+                        "could not be saved. Retry the same decision."
+                    ),
+                ) from exc
+
+            if claim is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Workflow completion could not be confirmed. "
+                        "Retry the same decision."
+                    ),
+                )
+
+        finally:
+            # Releases only this owner's lease while the claim is still
+            # in the 'claimed' state. After a successful mark, it is a no-op.
+            try:
+                database.release_approval_resume_lease(
+                    approval_id,
+                    lease_owner,
+                )
+            except Exception:
+                # An unreleased lease will expire and can be recovered.
+                pass
+
+    elif claim["state"] != "workflow_resumed":
+        raise HTTPException(
+            status_code=409,
+            detail="The approval claim is in an unexpected state.",
+        )
+    # Finalize using the saved decision. A retry after state persistence
+    # skips workflow resumption and retries this database operation.
+    updated_approval = database.decide_approval_request(
+        approval_id=approval_id,
+        decision=claim["decision"],
+        reviewer_id=claim["reviewer_id"],
+        decision_note=claim["decision_note"],
+    )
+
+    if updated_approval is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The workflow resumed, but the approval record could "
+                "not be finalized. The saved decision claim is preserved."
+            ),
+        )
+
+    return {
+        "approval": updated_approval,
+        "workflow": workflow_result,
+        "message": "Decision recorded and workflow resumed.",
+    }
+
+@app.post("/incidents/{incident_id}/approval-request")
+def create_incident_approval_request(
+    incident_id: int,
+    request: ApprovalRequestCreate,
+):
+    incident = database.get_incident_by_id(incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+
+    thread_id = str(uuid.uuid4())
+
+    approval = database.create_approval_request(
+        incident_id=incident_id,
+        proposed_action=request.proposed_action,
+        workflow_thread_id=thread_id,
+    )
+
+    if approval is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not create approval request.",
+        )
+
+    try:
+        app.state.approval_graph.invoke(
+            {
+                "approval_id": approval["id"],
+                "proposed_action": approval["proposed_action"],
+                "decision": "",
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not start the approval workflow.",
+        ) from exc
+
+    return {
+        "approval": approval,
+        "status": "pending",
+        "message": "Approval request created and is waiting for human review.",
+    }
