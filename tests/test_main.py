@@ -747,6 +747,80 @@ def test_resume_lease_blocks_second_acquisition(tmp_path, monkeypatch):
     assert first["owner"] == first["claim"]["resume_owner"]
 
 
+def test_resume_lease_can_be_renewed_by_current_owner(
+    tmp_path, monkeypatch
+):
+    approval_id, _ = _create_claimed_approval(tmp_path, monkeypatch)
+
+    lease = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+
+    assert lease["outcome"] == "acquired"
+
+    renewed = database.renew_approval_resume_lease(
+        approval_id,
+        lease["owner"],
+        lease_seconds=600,
+    )
+
+    assert renewed is True
+
+
+def test_resume_lease_cannot_be_renewed_by_another_owner(
+    tmp_path, monkeypatch
+):
+    approval_id, _ = _create_claimed_approval(tmp_path, monkeypatch)
+
+    lease = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+
+    assert lease["outcome"] == "acquired"
+
+    renewed = database.renew_approval_resume_lease(
+        approval_id,
+        "different-owner",
+        lease_seconds=600,
+    )
+
+    assert renewed is False
+
+
+def test_expired_resume_lease_cannot_be_renewed_by_previous_owner(
+    tmp_path, monkeypatch
+):
+    approval_id, database_path = _create_claimed_approval(
+        tmp_path, monkeypatch
+    )
+
+    lease = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+
+    assert lease["outcome"] == "acquired"
+
+    import sqlite3
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_lease_expires_at = 0
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        )
+
+    renewed = database.renew_approval_resume_lease(
+        approval_id,
+        lease["owner"],
+        lease_seconds=600,
+    )
+
+    assert renewed is False
+
+
 def test_expired_resume_lease_can_be_reacquired(tmp_path, monkeypatch):
     approval_id, database_path = _create_claimed_approval(
         tmp_path, monkeypatch
@@ -878,3 +952,32 @@ def test_decision_returns_conflict_when_resume_lease_is_busy():
     resume_mock.assert_not_called()
     finalize_mock.assert_not_called()
     assert approval["status"] == "pending"
+def test_expired_resume_lease_cannot_mark_workflow_resumed(
+    tmp_path, monkeypatch
+):
+    approval_id, database_path = _create_claimed_approval(
+        tmp_path, monkeypatch
+    )
+
+    lease = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+    assert lease["outcome"] == "acquired"
+
+    import sqlite3
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_lease_expires_at = 0
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        )
+
+    result = database.mark_approval_workflow_resumed(
+        approval_id, lease["owner"]
+    )
+
+    assert result is None

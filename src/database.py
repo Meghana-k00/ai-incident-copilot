@@ -386,6 +386,34 @@ def acquire_approval_resume_lease(
         }
 
 
+def renew_approval_resume_lease(
+    approval_id: int,
+    owner: str,
+    lease_seconds: int = 300,
+) -> bool:
+    """Extend an active lease only for its current owner."""
+    if lease_seconds <= 0:
+        raise ValueError("Lease duration must be positive.")
+
+    now = time.time()
+    expires_at = now + lease_seconds
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_lease_expires_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE approval_id = ?
+              AND state = 'claimed'
+              AND resume_owner = ?
+              AND resume_lease_expires_at > ?
+            """,
+            (expires_at, approval_id, owner, now),
+        )
+
+        return cursor.rowcount == 1
+
 def release_approval_resume_lease(
     approval_id: int,
     owner: str,
@@ -423,8 +451,9 @@ def mark_approval_workflow_resumed(
             WHERE approval_id = ?
               AND state = 'claimed'
               AND resume_owner = ?
+              AND resume_lease_expires_at > ?
             """,
-            (approval_id, owner),
+            (approval_id, owner, time.time()),
         )
 
         row = connection.execute(
