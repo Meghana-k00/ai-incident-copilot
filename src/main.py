@@ -242,22 +242,78 @@ def submit_approval_decision(
             detail="Unexpected approval decision claim result.",
         )
 
-    # Always resume using the durable saved decision.
-    try:
-        workflow_result = resume_approval(
-            app.state.approval_graph,
-            thread_id,
-            claim["decision"],
-        )
-    except (ValueError, RuntimeError) as exc:
-        # Keep the claim so a retry can use the same decision.
+    # Resume only if the saved claim has not already recorded
+    # successful workflow resumption.
+    workflow_result = None
+
+    if claim["state"] == "claimed":
+        try:
+            workflow_result = resume_approval(
+                app.state.approval_graph,
+                thread_id,
+                claim["decision"],
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Could not resume the approval workflow. "
+                    "Retry using the same decision and review details."
+                ),
+            ) from exc
+
+        try:
+            claim = database.mark_approval_workflow_resumed(
+                approval_id
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The workflow resumed, but its completion state "
+                    "could not be saved. Recovery is required."
+                ),
+            ) from exc
+
+        if claim is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The workflow resumed, but its completion state "
+                    "could not be confirmed."
+                ),
+            )
+
+    elif claim["state"] != "workflow_resumed":
         raise HTTPException(
-            status_code=503,
+            status_code=409,
+            detail="The approval claim is in an unexpected state.",
+        )
+
+    # Finalize using the saved decision. On a retry after successful
+    # state persistence, do not resume the workflow a second time.
+    updated_approval = database.decide_approval_request(
+        approval_id=approval_id,
+        decision=claim["decision"],
+        reviewer_id=claim["reviewer_id"],
+        decision_note=claim["decision_note"],
+    )
+
+    if updated_approval is None:
+        raise HTTPException(
+            status_code=409,
             detail=(
-                "Could not resume the approval workflow. "
-                "Retry using the same decision and review details."
+                "The workflow resumed, but the approval record could "
+                "not be finalized. The saved decision claim is preserved."
             ),
-        ) from exc
+        )
+
+    return {
+        "approval": updated_approval,
+        "workflow": workflow_result,
+        "message": "Decision recorded and workflow resumed.",
+    }
+
 
     # Finalize only after workflow resumption succeeds.
     updated_approval = database.decide_approval_request(

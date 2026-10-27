@@ -233,6 +233,16 @@ def test_decision_database_update_failure_is_not_hidden():
             return_value={"decision": "approved"},
         ) as resume_mock,
         patch(
+            "src.main.database.mark_approval_workflow_resumed",
+            return_value={
+                "approval_id": 1,
+                "decision": "approved",
+                "reviewer_id": "reviewer-test",
+                "decision_note": "Test",
+                "state": "workflow_resumed",
+            },
+        ),
+        patch(
             "src.main.database.decide_approval_request",
             return_value=None,
         ) as decide_mock,
@@ -322,3 +332,67 @@ def test_resume_failure_preserves_sqlite_approval_and_audit(
     events = database.get_approval_audit_log(approval["id"])
     assert [event["event_type"] for event in events] == ["created"]
 
+
+def test_retry_after_workflow_resume_state_save_failure(
+    monkeypatch,
+):
+    approval = {
+        "id": 1,
+        "status": "pending",
+        "workflow_thread_id": "test-thread",
+    }
+
+    saved_claim = {
+        "approval_id": 1,
+        "decision": "approved",
+        "reviewer_id": "reviewer-test",
+        "decision_note": "Test",
+        "state": "claimed",
+    }
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "APPROVAL_API_TOKEN": "test-token",
+                "APPROVAL_REVIEWER_ID": "reviewer-test",
+                "APPROVAL_REVIEWER_ROLE": "reviewer",
+            },
+        ),
+        patch(
+            "src.main.database.get_approval_request",
+            return_value=approval,
+        ),
+        patch(
+            "src.main.database.claim_approval_decision",
+            return_value={
+                "outcome": "created",
+                "claim": saved_claim,
+            },
+        ),
+        patch(
+            "src.main.resume_approval",
+            return_value={"decision": "approved"},
+        ) as resume_mock,
+        patch(
+            "src.main.database.mark_approval_workflow_resumed",
+            side_effect=RuntimeError("Simulated state-save failure"),
+        ),
+        patch(
+            "src.main.database.decide_approval_request",
+        ) as decide_mock,
+        TestClient(app) as test_client,
+    ):
+        response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "decision": "approved",
+                "decision_note": "Test",
+            },
+        )
+
+    assert response.status_code == 503
+    assert "workflow resumed" in response.json()["detail"].lower()
+    resume_mock.assert_called_once()
+    decide_mock.assert_not_called()
