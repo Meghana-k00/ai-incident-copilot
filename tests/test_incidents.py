@@ -385,3 +385,63 @@ def test_non_approval_decisions_are_recorded_in_audit(
     ]
     assert events[1]["actor_id"] == "reviewer-1"
     assert events[1]["details"] == "Decision recorded for testing."
+
+
+def _prepare_claim_test_database(tmp_path, monkeypatch):
+    from src import database
+
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claim_test.sqlite")
+    database.init_db()
+    incident = database.create_incident(
+        title="Claim test incident",
+        description="An incident created for decision claim tests.",
+        severity="high",
+        service_name="claim-test",
+    )
+    approval = database.create_approval_request(
+        incident_id=incident["id"],
+        proposed_action="Restart the test service",
+        workflow_thread_id="claim-test-thread",
+    )
+    return database, approval
+
+
+def test_claim_approval_decision_creates_claim_and_keeps_pending(tmp_path, monkeypatch):
+    database, approval = _prepare_claim_test_database(tmp_path, monkeypatch)
+    result = database.claim_approval_decision(
+        approval["id"], "approved", "reviewer-1", "Approved."
+    )
+    assert result["outcome"] == "created"
+    assert result["claim"]["decision"] == "approved"
+    assert result["claim"]["reviewer_id"] == "reviewer-1"
+    assert database.get_approval_request(approval["id"])["status"] == "pending"
+
+
+def test_claim_approval_decision_same_request_is_idempotent(tmp_path, monkeypatch):
+    database, approval = _prepare_claim_test_database(tmp_path, monkeypatch)
+    args = (approval["id"], "approved", "reviewer-1", "Approved.")
+    assert database.claim_approval_decision(*args)["outcome"] == "created"
+    assert database.claim_approval_decision(*args)["outcome"] == "existing"
+
+
+def test_claim_approval_decision_conflict_preserves_first_claim(tmp_path, monkeypatch):
+    database, approval = _prepare_claim_test_database(tmp_path, monkeypatch)
+    database.claim_approval_decision(
+        approval["id"], "approved", "reviewer-1", "Approved."
+    )
+    result = database.claim_approval_decision(
+        approval["id"], "rejected", "reviewer-2", "Rejected."
+    )
+    assert result["outcome"] == "conflict"
+    assert result["claim"]["decision"] == "approved"
+    assert result["claim"]["reviewer_id"] == "reviewer-1"
+
+
+def test_claim_approval_decision_missing_approval(tmp_path, monkeypatch):
+    from src import database
+
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claim_test.sqlite")
+    database.init_db()
+    assert database.claim_approval_decision(
+        999999, "approved", "reviewer-1"
+    ) == {"outcome": "missing", "claim": None}

@@ -176,6 +176,7 @@ def read_approval(
     return approval
 
 
+
 @app.post("/approvals/{approval_id}/decision")
 def submit_approval_decision(
     approval_id: int,
@@ -203,29 +204,77 @@ def submit_approval_decision(
             detail="This approval request is not linked to a workflow.",
         )
 
+    # Atomically claim the decision before resuming the workflow.
+    try:
+        claim_result = database.claim_approval_decision(
+            approval_id=approval_id,
+            decision=decision.decision,
+            reviewer_id=reviewer["reviewer_id"],
+            decision_note=decision.decision_note,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not claim the approval decision.",
+        ) from exc
+
+    outcome = claim_result["outcome"]
+    claim = claim_result["claim"]
+
+    if outcome == "missing":
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found.",
+        )
+
+    if outcome == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A different decision has already been claimed "
+                "for this approval, or the approval is no longer pending."
+            ),
+        )
+
+    if outcome not in {"created", "existing"} or claim is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected approval decision claim result.",
+        )
+
+    # Always resume using the durable saved decision.
     try:
         workflow_result = resume_approval(
             app.state.approval_graph,
             thread_id,
-            decision.decision,
+            claim["decision"],
         )
     except (ValueError, RuntimeError) as exc:
+        # Keep the claim so a retry can use the same decision.
         raise HTTPException(
             status_code=503,
-            detail="Could not resume the approval workflow.",
+            detail=(
+                "Could not resume the approval workflow. "
+                "Retry using the same decision and review details."
+            ),
         ) from exc
 
+    # Finalize only after workflow resumption succeeds.
     updated_approval = database.decide_approval_request(
         approval_id=approval_id,
-        decision=decision.decision,
-        reviewer_id=reviewer["reviewer_id"],
-        decision_note=decision.decision_note,
+        decision=claim["decision"],
+        reviewer_id=claim["reviewer_id"],
+        decision_note=claim["decision_note"],
     )
 
     if updated_approval is None:
+        # The durable claim remains available for recovery.
         raise HTTPException(
             status_code=409,
-            detail="Approval request could not be updated.",
+            detail=(
+                "The workflow resumed, but the approval record could "
+                "not be finalized. The saved decision claim is preserved."
+            ),
         )
 
     return {

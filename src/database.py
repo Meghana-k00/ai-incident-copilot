@@ -76,6 +76,26 @@ def init_db():
         )
 
 
+        # Durable decision claim; existing approval status CHECK stays unchanged.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approval_decision_claims (
+                approval_id INTEGER PRIMARY KEY,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('approved', 'rejected', 'changes_requested')
+                ),
+                reviewer_id TEXT NOT NULL,
+                decision_note TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'claimed' CHECK (
+                    state IN ('claimed', 'workflow_resumed', 'completed')
+                ),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (approval_id) REFERENCES approval_requests(id)
+            )
+            """
+        )
+
 def create_incident(title, description, severity, service_name):
     with get_connection() as connection:
         cursor = connection.execute(
@@ -212,6 +232,92 @@ def get_approval_request(approval_id: int) -> dict | None:
         ).fetchone()
 
         return dict(row) if row is not None else None
+
+
+
+def claim_approval_decision(
+    approval_id: int,
+    decision: str,
+    reviewer_id: str,
+    decision_note: str = "",
+) -> dict:
+    """Atomically claim a decision. Outcomes: created, existing, conflict, missing."""
+    if decision not in {"approved", "rejected", "changes_requested"}:
+        raise ValueError("Unsupported approval decision.")
+    reviewer = reviewer_id.strip()
+    if not reviewer:
+        raise ValueError("Reviewer ID cannot be empty.")
+    note = decision_note or ""
+
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        approval = connection.execute(
+            "SELECT status FROM approval_requests WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if approval is None:
+            return {"outcome": "missing", "claim": None}
+
+        existing = connection.execute(
+            "SELECT * FROM approval_decision_claims WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if existing is not None:
+            claim = dict(existing)
+            same = (
+                claim["decision"] == decision
+                and claim["reviewer_id"] == reviewer
+                and claim["decision_note"] == note
+            )
+            return {"outcome": "existing" if same else "conflict", "claim": claim}
+
+        if approval["status"] != "pending":
+            return {"outcome": "conflict", "claim": None}
+
+        connection.execute(
+            """
+            INSERT INTO approval_decision_claims
+                (approval_id, decision, reviewer_id, decision_note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (approval_id, decision, reviewer, note),
+        )
+        row = connection.execute(
+            "SELECT * FROM approval_decision_claims WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        return {"outcome": "created", "claim": dict(row)}
+
+def mark_approval_workflow_resumed(approval_id: int) -> dict | None:
+    """Persist that the approval workflow has resumed successfully."""
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET state = 'workflow_resumed',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE approval_id = ?
+              AND state = 'claimed'
+            """,
+            (approval_id,),
+        )
+
+        row = connection.execute(
+            """
+            SELECT *
+            FROM approval_decision_claims
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        claim = dict(row)
+        if claim["state"] not in {"workflow_resumed", "completed"}:
+            return None
+
+        return claim
 
 
 def decide_approval_request(
