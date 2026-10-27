@@ -319,6 +319,13 @@ def test_cannot_decide_approval_request_twice(client):
 
     assert first["status"] == "approved"
     assert second is None
+    
+    events = database.get_approval_audit_log(approval["id"])
+
+    assert [event["event_type"] for event in events] == [
+        "created",
+        "approved",
+    ]
 
 
 def test_invalid_approval_decision_is_rejected(client):
