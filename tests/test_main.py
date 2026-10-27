@@ -4,9 +4,20 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from src.main import app
+from src import database
 
 
 client = TestClient(app)
+def acquired_lease(approval_id, lease_seconds=300):
+    return {
+        "outcome": "acquired",
+        "owner": "test-owner",
+        "claim": {
+            "approval_id": approval_id,
+            "state": "claimed",
+            "resume_owner": "test-owner",
+        },
+    }
 
 
 def test_investigate_returns_404_for_missing_incident():
@@ -168,6 +179,14 @@ def test_decision_resume_failure_leaves_approval_pending():
         patch(
             "src.main.database.decide_approval_request",
         ) as decide_mock,
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            side_effect=acquired_lease,
+        ),
+        patch(
+            "src.main.database.release_approval_resume_lease",
+            return_value=True,
+        ),
         TestClient(app) as test_client,
     ):
         response = test_client.post(
@@ -246,6 +265,14 @@ def test_decision_database_update_failure_is_not_hidden():
             "src.main.database.decide_approval_request",
             return_value=None,
         ) as decide_mock,
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            side_effect=acquired_lease,
+        ),
+        patch(
+            "src.main.database.release_approval_resume_lease",
+            return_value=True,
+        ),
         TestClient(app) as test_client,
     ):
         response = test_client.post(
@@ -381,6 +408,14 @@ def test_retry_after_workflow_resume_state_save_failure(
         patch(
             "src.main.database.decide_approval_request",
         ) as decide_mock,
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            side_effect=acquired_lease,
+        ),
+        patch(
+            "src.main.database.release_approval_resume_lease",
+            return_value=True,
+        ),
         TestClient(app) as test_client,
     ):
         response = test_client.post(
@@ -444,6 +479,14 @@ def test_completed_matching_checkpoint_skips_second_resume():
             "src.main.database.decide_approval_request",
             return_value=finalized,
         ) as finalize_mock,
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            side_effect=acquired_lease,
+        ),
+        patch(
+            "src.main.database.release_approval_resume_lease",
+            return_value=True,
+        ),
         TestClient(app) as test_client,
     ):
         response = test_client.post(
@@ -502,6 +545,14 @@ def test_completed_conflicting_checkpoint_preserves_claim():
         patch(
             "src.main.database.decide_approval_request",
         ) as finalize_mock,
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            side_effect=acquired_lease,
+        ),
+        patch(
+            "src.main.database.release_approval_resume_lease",
+            return_value=True,
+        ),
         TestClient(app) as test_client,
     ):
         response = test_client.post(
@@ -575,6 +626,14 @@ def test_retry_recovers_after_workflow_state_save_failure(monkeypatch):
             "src.main.database.decide_approval_request",
             return_value=finalized,
         ) as finalize_mock,
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            side_effect=acquired_lease,
+        ),
+        patch(
+            "src.main.database.release_approval_resume_lease",
+            return_value=True,
+        ),
         TestClient(app) as test_client,
     ):
         first_response = test_client.post(
@@ -644,3 +703,120 @@ def test_retry_after_finalized_approval_does_not_resume_again(
 
     assert response.status_code == 409
     resume_mock.assert_not_called()
+
+def _create_claimed_approval(tmp_path, monkeypatch):
+    """Create an isolated approval claim in a temporary SQLite database."""
+    database_path = tmp_path / "lease_test.db"
+    monkeypatch.setattr(database, "DATABASE_PATH", database_path)
+    database.init_db()
+
+    incident = database.create_incident(
+        title="Lease test incident",
+        description="Testing approval resume leases.",
+        severity="high",
+        service_name="test-service",
+    )
+    approval = database.create_approval_request(
+        incident_id=incident["id"],
+        proposed_action="Restart test service",
+        workflow_thread_id="lease-test-thread",
+    )
+    claim_result = database.claim_approval_decision(
+        approval_id=approval["id"],
+        decision="approved",
+        reviewer_id="lease-reviewer",
+        decision_note="Lease test",
+    )
+
+    assert claim_result["outcome"] == "created"
+    return approval["id"], database_path
+
+
+def test_resume_lease_blocks_second_acquisition(tmp_path, monkeypatch):
+    approval_id, _ = _create_claimed_approval(tmp_path, monkeypatch)
+
+    first = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+    second = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+
+    assert first["outcome"] == "acquired"
+    assert second["outcome"] == "busy"
+    assert first["owner"] == first["claim"]["resume_owner"]
+
+
+def test_expired_resume_lease_can_be_reacquired(tmp_path, monkeypatch):
+    approval_id, database_path = _create_claimed_approval(
+        tmp_path, monkeypatch
+    )
+
+    first = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+    assert first["outcome"] == "acquired"
+
+    import sqlite3
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_lease_expires_at = 0
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        )
+
+    second = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+
+    assert second["outcome"] == "acquired"
+    assert second["owner"] != first["owner"]
+
+
+def test_previous_owner_cannot_release_reacquired_lease(
+    tmp_path, monkeypatch
+):
+    approval_id, database_path = _create_claimed_approval(
+        tmp_path, monkeypatch
+    )
+
+    first = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+    assert first["outcome"] == "acquired"
+
+    import sqlite3
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_lease_expires_at = 0
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        )
+
+    second = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+    assert second["outcome"] == "acquired"
+
+    released = database.release_approval_resume_lease(
+        approval_id, first["owner"]
+    )
+
+    assert released is False
+
+    still_busy = database.acquire_approval_resume_lease(
+        approval_id, lease_seconds=300
+    )
+    assert still_busy["outcome"] == "busy"
+
+    assert database.release_approval_resume_lease(
+        approval_id, second["owner"]
+    ) is True

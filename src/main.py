@@ -247,74 +247,114 @@ def submit_approval_decision(
     workflow_result = None
 
     if claim["state"] == "claimed":
-        # Inspect the checkpoint before resuming: the previous request
-        # may have completed the workflow but failed to save the claim state.
         try:
-            completed_decision = get_completed_approval_decision(
-                app.state.approval_graph,
-                thread_id,
+            lease_result = database.acquire_approval_resume_lease(
+                approval_id=approval_id,
+                lease_seconds=300,
             )
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
-                detail="Could not inspect the approval workflow checkpoint.",
+                detail="Could not acquire the workflow resume lease.",
             ) from exc
 
-        if completed_decision is not None:
-            if completed_decision != claim["decision"]:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "The workflow checkpoint contains a different "
-                        "decision. Manual reconciliation is required."
-                    ),
-                )
+        if lease_result["outcome"] == "busy":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another request is processing this approval. "
+                    "Retry the same decision shortly."
+                ),
+            )
 
-            # The graph already completed with the saved decision.
-            workflow_result = {"decision": completed_decision}
-        else:
+        if lease_result["outcome"] != "acquired":
+            raise HTTPException(
+                status_code=409,
+                detail="The approval workflow is not available for resumption.",
+            )
+
+        lease_owner = lease_result["owner"]
+
+        try:
             try:
-                workflow_result = resume_approval(
+                completed_decision = get_completed_approval_decision(
                     app.state.approval_graph,
                     thread_id,
-                    claim["decision"],
                 )
-            except (ValueError, RuntimeError) as exc:
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not inspect the approval workflow checkpoint.",
+                ) from exc
+
+            if completed_decision is not None:
+                if completed_decision != claim["decision"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The workflow checkpoint contains a different "
+                            "decision. Manual reconciliation is required."
+                        ),
+                    )
+
+                workflow_result = {"decision": completed_decision}
+
+            else:
+                try:
+                    workflow_result = resume_approval(
+                        app.state.approval_graph,
+                        thread_id,
+                        claim["decision"],
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Could not resume the approval workflow. "
+                            "Retry using the same decision and review details."
+                        ),
+                    ) from exc
+
+            try:
+                claim = database.mark_approval_workflow_resumed(
+                    approval_id,
+                    lease_owner,
+                )
+            except Exception as exc:
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Could not resume the approval workflow. "
-                        "Retry using the same decision and review details."
+                        "The workflow resumed, but its completion state "
+                        "could not be saved. Retry the same decision."
                     ),
                 ) from exc
 
-        # Record successful workflow completion in SQLite.
-        try:
-            claim = database.mark_approval_workflow_resumed(approval_id)
-        except (ValueError, RuntimeError) as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "The workflow resumed, but its completion state "
-                    "could not be saved. Recovery is required."
-                ),
-            ) from exc
+            if claim is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Workflow completion could not be confirmed. "
+                        "Retry the same decision."
+                    ),
+                )
 
-        if claim is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "The workflow resumed, but its completion state "
-                    "could not be confirmed."
-                ),
-            )
+        finally:
+            # Releases only this owner's lease while the claim is still
+            # in the 'claimed' state. After a successful mark, it is a no-op.
+            try:
+                database.release_approval_resume_lease(
+                    approval_id,
+                    lease_owner,
+                )
+            except Exception:
+                # An unreleased lease will expire and can be recovered.
+                pass
 
     elif claim["state"] != "workflow_resumed":
         raise HTTPException(
             status_code=409,
             detail="The approval claim is in an unexpected state.",
         )
-
     # Finalize using the saved decision. A retry after state persistence
     # skips workflow resumption and retries this database operation.
     updated_approval = database.decide_approval_request(

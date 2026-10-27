@@ -2,6 +2,8 @@
 import sqlite3
 from pathlib import Path
 from contextlib import contextmanager
+import time
+import uuid
 
 
 # Store the database in the project's data folder
@@ -95,6 +97,29 @@ def init_db():
             )
             """
         )
+                # Add resume-lease columns to existing databases safely.
+        existing_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(approval_decision_claims)"
+            ).fetchall()
+        }
+
+        if "resume_owner" not in existing_columns:
+            connection.execute(
+                """
+                ALTER TABLE approval_decision_claims
+                ADD COLUMN resume_owner TEXT
+                """
+            )
+
+        if "resume_lease_expires_at" not in existing_columns:
+            connection.execute(
+                """
+                ALTER TABLE approval_decision_claims
+                ADD COLUMN resume_lease_expires_at REAL
+                """
+            )
 
 def create_incident(title, description, severity, service_name):
     with get_connection() as connection:
@@ -286,19 +311,120 @@ def claim_approval_decision(
             (approval_id,),
         ).fetchone()
         return {"outcome": "created", "claim": dict(row)}
+def acquire_approval_resume_lease(
+    approval_id: int,
+    lease_seconds: int = 300,
+) -> dict:
+    """Atomically acquire or recover an approval workflow resume lease."""
+    if lease_seconds <= 0:
+        raise ValueError("Lease duration must be positive.")
 
-def mark_approval_workflow_resumed(approval_id: int) -> dict | None:
-    """Persist that the approval workflow has resumed successfully."""
+    now = time.time()
+    owner = str(uuid.uuid4())
+    expires_at = now + lease_seconds
+
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT *
+            FROM approval_decision_claims
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        ).fetchone()
+
+        if row is None:
+            return {"outcome": "missing", "claim": None}
+
+        claim = dict(row)
+
+        if claim["state"] != "claimed":
+            return {
+                "outcome": "not_claimed",
+                "claim": claim,
+            }
+
+        current_expiry = claim.get("resume_lease_expires_at")
+
+        if (
+            claim.get("resume_owner") is not None
+            and current_expiry is not None
+            and current_expiry > now
+        ):
+            return {
+                "outcome": "busy",
+                "claim": claim,
+            }
+
+        connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_owner = ?,
+                resume_lease_expires_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE approval_id = ?
+              AND state = 'claimed'
+            """,
+            (owner, expires_at, approval_id),
+        )
+
+        updated = connection.execute(
+            """
+            SELECT *
+            FROM approval_decision_claims
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+        ).fetchone()
+
+        return {
+            "outcome": "acquired",
+            "owner": owner,
+            "claim": dict(updated),
+        }
+
+
+def release_approval_resume_lease(
+    approval_id: int,
+    owner: str,
+) -> bool:
+    """Release a lease only when the caller still owns it."""
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE approval_decision_claims
+            SET resume_owner = NULL,
+                resume_lease_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE approval_id = ?
+              AND resume_owner = ?
+              AND state = 'claimed'
+            """,
+            (approval_id, owner),
+        )
+
+        return cursor.rowcount > 0
+
+def mark_approval_workflow_resumed(
+    approval_id: int,
+    owner: str,
+) -> dict | None:
+    """Mark the workflow resumed only for the current lease owner."""
     with get_connection() as connection:
         connection.execute(
             """
             UPDATE approval_decision_claims
             SET state = 'workflow_resumed',
+                resume_owner = NULL,
+                resume_lease_expires_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE approval_id = ?
               AND state = 'claimed'
+              AND resume_owner = ?
             """,
-            (approval_id,),
+            (approval_id, owner),
         )
 
         row = connection.execute(
@@ -314,11 +440,11 @@ def mark_approval_workflow_resumed(approval_id: int) -> dict | None:
             return None
 
         claim = dict(row)
-        if claim["state"] not in {"workflow_resumed", "completed"}:
+
+        if claim["state"] != "workflow_resumed":
             return None
 
         return claim
-
 
 def decide_approval_request(
     approval_id: int,
