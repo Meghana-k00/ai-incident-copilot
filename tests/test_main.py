@@ -820,3 +820,61 @@ def test_previous_owner_cannot_release_reacquired_lease(
     assert database.release_approval_resume_lease(
         approval_id, second["owner"]
     ) is True
+def test_decision_returns_conflict_when_resume_lease_is_busy():
+    approval = {
+        "id": 1,
+        "status": "pending",
+        "workflow_thread_id": "test-thread",
+    }
+
+    claim = {
+        "approval_id": 1,
+        "decision": "approved",
+        "reviewer_id": "reviewer-test",
+        "decision_note": "Test",
+        "state": "claimed",
+    }
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "APPROVAL_API_TOKEN": "test-token",
+                "APPROVAL_REVIEWER_ID": "reviewer-test",
+                "APPROVAL_REVIEWER_ROLE": "reviewer",
+            },
+        ),
+        patch(
+            "src.main.database.get_approval_request",
+            return_value=approval,
+        ),
+        patch(
+            "src.main.database.claim_approval_decision",
+            return_value={"outcome": "existing", "claim": claim},
+        ),
+        patch(
+            "src.main.database.acquire_approval_resume_lease",
+            return_value={"outcome": "busy", "claim": claim},
+        ),
+        patch("src.main.resume_approval") as resume_mock,
+        patch(
+            "src.main.database.decide_approval_request",
+        ) as finalize_mock,
+        TestClient(app) as test_client,
+    ):
+        response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "decision": "approved",
+                "decision_note": "Test",
+            },
+        )
+
+    assert response.status_code == 409
+    assert "another request is processing" in (
+        response.json()["detail"].lower()
+    )
+    resume_mock.assert_not_called()
+    finalize_mock.assert_not_called()
+    assert approval["status"] == "pending"
