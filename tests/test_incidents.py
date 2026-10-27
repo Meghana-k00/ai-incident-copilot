@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from src.main import app
 from src import database
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -319,7 +321,7 @@ def test_cannot_decide_approval_request_twice(client):
 
     assert first["status"] == "approved"
     assert second is None
-    
+
     events = database.get_approval_audit_log(approval["id"])
 
     assert [event["event_type"] for event in events] == [
@@ -445,3 +447,49 @@ def test_claim_approval_decision_missing_approval(tmp_path, monkeypatch):
     assert database.claim_approval_decision(
         999999, "approved", "reviewer-1"
     ) == {"outcome": "missing", "claim": None}
+def test_concurrent_approval_decisions_allow_only_one_claim(
+    tmp_path, monkeypatch
+):
+    database, approval = _prepare_claim_test_database(
+        tmp_path, monkeypatch
+    )
+    barrier = Barrier(2)
+
+    def submit_claim(decision, reviewer):
+        barrier.wait()
+        return database.claim_approval_decision(
+            approval["id"],
+            decision,
+            reviewer,
+            f"{decision} note",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            submit_claim, "approved", "reviewer-1"
+        )
+        second = executor.submit(
+            submit_claim, "rejected", "reviewer-2"
+        )
+
+        results = [first.result(), second.result()]
+
+    outcomes = sorted(result["outcome"] for result in results)
+
+    assert outcomes == ["conflict", "created"]
+
+    saved_claim = database.claim_approval_decision(
+        approval["id"],
+        "approved",
+        "reviewer-1",
+        "approved note",
+    )
+    assert saved_claim["outcome"] in {"existing", "conflict"}
+
+    claims = [
+        result["claim"]
+        for result in results
+        if result["outcome"] == "created"
+    ]
+    assert len(claims) == 1
+    assert database.get_approval_request(approval["id"])["status"] == "pending"
