@@ -515,3 +515,95 @@ def test_completed_conflicting_checkpoint_preserves_claim():
     resume_mock.assert_not_called()
     mark_mock.assert_not_called()
     finalize_mock.assert_not_called()
+
+
+def test_retry_recovers_after_workflow_state_save_failure(monkeypatch):
+    approval = {
+        "id": 1,
+        "status": "pending",
+        "workflow_thread_id": "test-thread",
+    }
+    claim = {
+        "approval_id": 1,
+        "decision": "approved",
+        "reviewer_id": "reviewer-test",
+        "decision_note": "Test",
+        "state": "claimed",
+    }
+    finalized = {
+        "id": 1,
+        "status": "approved",
+        "reviewer_id": "reviewer-test",
+        "decision_note": "Test",
+    }
+
+    from unittest.mock import call
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "APPROVAL_API_TOKEN": "test-token",
+                "APPROVAL_REVIEWER_ID": "reviewer-test",
+                "APPROVAL_REVIEWER_ROLE": "reviewer",
+            },
+        ),
+        patch(
+            "src.main.database.get_approval_request",
+            return_value=approval,
+        ),
+        patch(
+            "src.main.database.claim_approval_decision",
+            return_value={"outcome": "existing", "claim": claim},
+        ),
+        patch(
+            "src.main.get_completed_approval_decision",
+            side_effect=[None, "approved"],
+        ) as checkpoint_mock,
+        patch(
+            "src.main.resume_approval",
+            return_value={"decision": "approved"},
+        ) as resume_mock,
+        patch(
+            "src.main.database.mark_approval_workflow_resumed",
+            side_effect=[
+                RuntimeError("Simulated state-save failure"),
+                {**claim, "state": "workflow_resumed"},
+            ],
+        ) as mark_mock,
+        patch(
+            "src.main.database.decide_approval_request",
+            return_value=finalized,
+        ) as finalize_mock,
+        TestClient(app) as test_client,
+    ):
+        first_response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={"decision": "approved", "decision_note": "Test"},
+        )
+
+        assert first_response.status_code == 503
+        finalize_mock.assert_not_called()
+
+        second_response = test_client.post(
+            "/approvals/1/decision",
+            headers={"Authorization": "Bearer test-token"},
+            json={"decision": "approved", "decision_note": "Test"},
+        )
+
+    assert second_response.status_code == 200
+    assert second_response.json()["approval"]["status"] == "approved"
+    checkpoint_mock.assert_has_calls([call(app.state.approval_graph, "test-thread")] * 2)
+    resume_mock.assert_called_once_with(
+        app.state.approval_graph,
+        "test-thread",
+        "approved",
+    )
+    assert mark_mock.call_count == 2
+    finalize_mock.assert_called_once_with(
+        approval_id=1,
+        decision="approved",
+        reviewer_id="reviewer-test",
+        decision_note="Test",
+    )
