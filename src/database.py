@@ -26,7 +26,7 @@ def get_connection():
         raise
     finally:
         connection.close()
-        
+
 def init_db():
     with get_connection() as connection:
         connection.execute(
@@ -41,7 +41,7 @@ def init_db():
             )
             """
         )
-        
+
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS approval_requests (
