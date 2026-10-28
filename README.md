@@ -70,25 +70,27 @@ The configured local inference workflow does not require a paid LLM API key.
 
 The following is a high-level view of the main project components. The exact repository may contain additional files.
 
-```text
 ai-incident-copilot/
 ├── src/
-│   ├── database.py
-│   ├── auth.py
+│   ├── __init__.py
 │   ├── approval_workflow.py
-│   ├── investigation.py
+│   ├── auth.py
+│   ├── database.py
 │   ├── ingest_knowledge.py
+│   ├── investigation.py
 │   ├── main.py
 │   ├── models.py
 │   └── retrieval.py
 ├── tests/
+│   ├── __init__.py
+│   ├── test_approval_workflow.py
+│   ├── test_auth.py
 │   ├── test_health.py
 │   ├── test_incident_endpoints.py
 │   ├── test_incidents.py
 │   ├── test_investigation.py
 │   ├── test_main.py
-│   ├── test_retrieval.py
-│   └── additional approval workflow tests
+│   └── test_retrieval.py
 ├── evaluation/
 │   ├── run_evaluation.py
 │   └── test_investigation_quality.py
@@ -97,7 +99,6 @@ ai-incident-copilot/
 ├── requirements.txt
 ├── .gitignore
 └── README.md
-```
 
 Local databases, workflow checkpoint files, vector-store data, virtual environments, cache files, and secrets should generally be excluded from version control. Commit sample data only when it is sanitized and intentionally required.
 

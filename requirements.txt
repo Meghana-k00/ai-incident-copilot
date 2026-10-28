@@ -5,3 +5,4 @@ httpx
 chromadb
 langgraph==1.2.16
 langgraph-checkpoint-sqlite==3.1.2
+pydantic
