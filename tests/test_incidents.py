@@ -199,22 +199,25 @@ def test_investigate_incident_success(client, monkeypatch):
         json=sample_incident(),
     ).json()
 
-    def fake_investigate(incident, retriever=None):
+    captured = {}
+
+    def fake_investigate(incident, retriever=None, request_id=None):
+        captured["request_id"] = request_id
         return {
             "incident_id": incident["id"],
             "model": "qwen2.5:3b",
             "investigation": "Check database connectivity and server status.",
         }
-
     monkeypatch.setattr(
         "src.main.investigate_incident",
         fake_investigate,
     )
 
     response = client.post(
-        f"/incidents/{created['id']}/investigate"
+        f"/incidents/{created['id']}/investigate",
+        headers={"X-Request-ID": "test-request-123"},
     )
-
+    assert captured["request_id"] == "test-request-123"
     assert response.status_code == 200
     assert response.json()["incident_id"] == created["id"]
     assert response.json()["model"] == "qwen2.5:3b"
@@ -242,7 +245,7 @@ def test_investigation_runtime_error(client, monkeypatch):
         json=sample_incident(),
     ).json()
 
-    def fake_investigate(incident, retriever=None):
+    def fake_investigate(incident, retriever=None, request_id=None):
         raise RuntimeError("Ollama is unavailable")
 
     monkeypatch.setattr(

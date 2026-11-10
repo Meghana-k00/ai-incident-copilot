@@ -1,4 +1,4 @@
-
+import logging
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -981,3 +981,33 @@ def test_expired_resume_lease_cannot_mark_workflow_resumed(
     )
 
     assert result is None
+def test_request_id_is_added_to_successful_response():
+    response = client.get("/health")
+
+    assert response.status_code == 200
+
+    request_id = response.headers.get("X-Request-ID")
+
+    assert request_id is not None
+    assert len(request_id) > 0
+
+
+def test_failed_request_is_logged_with_request_id(caplog):
+    with caplog.at_level(logging.INFO, logger="src.main"):
+        response = client.get("/this-route-does-not-exist")
+
+    assert response.status_code == 404
+
+    request_id = response.headers.get("X-Request-ID")
+    assert request_id is not None
+
+    log_messages = [record.getMessage() for record in caplog.records]
+
+    matching_logs = [
+        message for message in log_messages
+        if "Request completed" in message
+    ]
+
+    assert matching_logs
+    assert any(request_id in message for message in matching_logs)
+    assert any("status_code=404" in message for message in matching_logs)

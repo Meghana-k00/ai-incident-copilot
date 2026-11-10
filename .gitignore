@@ -17,3 +17,6 @@ data/
 # Virtual environments and Python caches
 .venv/
 __pycache__/
+
+# Generated evaluation reports
+evaluation/reports/

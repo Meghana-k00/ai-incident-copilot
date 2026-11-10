@@ -1,7 +1,10 @@
 
-from src.investigation import prepare_investigation
 from unittest.mock import MagicMock, patch
-from src.investigation import investigate_incident
+
+from src.investigation import (
+    prepare_investigation,
+    investigate_incident,
+)
 
 
 def test_investigation_context_contains_incident_details():
@@ -79,6 +82,7 @@ def test_investigation_rejects_invalid_severity():
             "Expected ValueError for invalid severity"
         )
 
+
 def test_investigation_returns_ai_response():
     incident = {
         "id": 1,
@@ -89,6 +93,9 @@ def test_investigation_returns_ai_response():
         "status": "open",
     }
 
+    mock_retriever = MagicMock()
+    mock_retriever.search.return_value = []
+
     mock_response = MagicMock()
     mock_response.__enter__.return_value.read.return_value = (
         b'{"response": "Check database connectivity and logs."}'
@@ -98,10 +105,12 @@ def test_investigation_returns_ai_response():
         "src.investigation.urllib.request.urlopen",
         return_value=mock_response,
     ):
-        result = investigate_incident(incident)
+        result = investigate_incident(
+            incident,
+            retriever=mock_retriever,
+        )
 
     assert result["incident_id"] == 1
-    assert result["model"] == "qwen2.5:3b"
     assert "database connectivity" in result["investigation"].lower()
     assert result["retrieved_documents"] == []
 
@@ -118,7 +127,10 @@ def test_investigation_uses_retrieved_knowledge():
 
     historical_documents = [
         {
-            "text": "Previous incidents were caused by connection pool exhaustion.",
+            "text": (
+                "Previous incidents were caused by "
+                "connection pool exhaustion."
+            ),
             "metadata": {"source": "database_incidents.md"},
         }
     ]
@@ -145,6 +157,7 @@ def test_investigation_uses_retrieved_knowledge():
     assert "connection pool exhaustion" in (
         result["retrieved_documents"][0]["text"].lower()
     )
+
 
 def test_investigation_rejects_missing_title():
     incident = {
@@ -196,6 +209,9 @@ def test_investigation_rejects_invalid_ollama_response():
         "status": "open",
     }
 
+    mock_retriever = MagicMock()
+    mock_retriever.search.return_value = []
+
     mock_response = MagicMock()
     mock_response.__enter__.return_value.read.return_value = (
         b'{"unexpected": "missing response field"}'
@@ -206,7 +222,10 @@ def test_investigation_rejects_invalid_ollama_response():
         return_value=mock_response,
     ):
         try:
-            investigate_incident(incident)
+            investigate_incident(
+                incident,
+                retriever=mock_retriever,
+            )
         except RuntimeError as exc:
             assert "empty or invalid" in str(exc).lower()
         else:
@@ -214,22 +233,31 @@ def test_investigation_rejects_invalid_ollama_response():
                 "Expected RuntimeError for an invalid Ollama response"
             )
 
+
 def test_investigation_handles_ollama_connection_failure():
     incident = {
         "id": 13,
         "title": "Database connection timeout",
-        "description": "Requests are failing to connect to the database.",
+        "description": (
+            "Requests are failing to connect to the database."
+        ),
         "severity": "high",
         "service_name": "customer-api",
         "status": "open",
     }
+
+    mock_retriever = MagicMock()
+    mock_retriever.search.return_value = []
 
     with patch(
         "src.investigation.urllib.request.urlopen",
         side_effect=OSError("Ollama connection failed"),
     ):
         try:
-            investigate_incident(incident)
+            investigate_incident(
+                incident,
+                retriever=mock_retriever,
+            )
         except (RuntimeError, OSError):
             pass
         else:

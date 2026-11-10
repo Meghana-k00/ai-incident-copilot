@@ -1,7 +1,8 @@
-
+import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from src.models import IncidentCreate, IncidentResponse, IncidentUpdate
 from src import database
@@ -18,13 +19,51 @@ from src.models import ApprovalRequestCreate
 
 from src.approval_workflow import resume_approval
 from src.approval_workflow import get_completed_approval_decision
+import json
+from contextvars import ContextVar
+request_id_context: ContextVar[str | None] = ContextVar(
+    "request_id",
+    default=None,
+)
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(record, "request_id", None),
+        }
 
+        return json.dumps(log_data)
 
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, "request_id"):
+            record.request_id = request_id_context.get()
+
+        return True
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+handler.addFilter(RequestIdFilter())
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[handler],
+    force=True,
+)
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting AI Incident Copilot")
+
     database.init_db()
+    logger.info("Database initialized")
+
     app.state.retriever = IncidentRetriever()
+    logger.info("Incident retriever initialized")
 
     checkpoint_db = os.getenv(
         "APPROVAL_CHECKPOINT_DB",
@@ -34,7 +73,12 @@ async def lifespan(app: FastAPI):
     with SqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
         checkpointer.setup()
         app.state.approval_graph = build_approval_graph(checkpointer)
+
+        logger.info("Approval workflow initialized")
+
         yield
+
+    logger.info("Shutting down AI Incident Copilot")
 
 
 
@@ -44,7 +88,44 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+@app.middleware("http")
+async def log_requests(request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
 
+    token = request_id_context.set(request_id)
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+
+        duration = time.perf_counter() - start_time
+
+        response.headers["X-Request-ID"] = request_id
+
+        logger.info(
+            "Request completed | request_id=%s | method=%s | path=%s | status_code=%s | duration_seconds=%.3f",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
+        return response
+
+    except Exception:
+        duration = time.perf_counter() - start_time
+
+        logger.exception(
+            "Request failed | method=%s | path=%s | duration_seconds=%.3f",
+            request.method,
+            request.url.path,
+            duration,
+        )
+        raise
+
+    finally:
+        request_id_context.reset(token)
 
 @app.get("/")
 def home():
@@ -126,7 +207,10 @@ def delete_incident_endpoint(incident_id: int):
 
 
 @app.post("/incidents/{incident_id}/investigate")
-def investigate_incident_endpoint(incident_id: int):
+def investigate_incident_endpoint(
+    incident_id: int,
+    request: Request,
+):
     incident = database.get_incident_by_id(incident_id)
 
     if incident is None:
@@ -138,6 +222,8 @@ def investigate_incident_endpoint(incident_id: int):
         result = investigate_incident(
             incident,
             retriever=getattr(app.state, "retriever", None),
+            request_id=request.state.request_id,
+
         )
     except ValueError as exc:
         raise HTTPException(
