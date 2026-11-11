@@ -1,10 +1,27 @@
-
+import json
 from unittest.mock import MagicMock, patch
 
 from src.investigation import (
     prepare_investigation,
     investigate_incident,
 )
+
+VALID_INVESTIGATION_RESPONSE = """
+Evidence-supported observations:
+- The customer API is experiencing database connection timeouts.
+
+Unverified root-cause hypotheses:
+- No root-cause hypotheses can be established from the available information.
+
+Recommended diagnostic checks:
+- Review the customer API and database connection logs.
+
+Safe remediation suggestions:
+- No safe remediation suggestions can be provided without further evidence.
+
+Evidence gaps:
+- Database connection metrics and detailed application logs are unavailable.
+""".strip()
 
 
 def test_investigation_context_contains_incident_details():
@@ -98,7 +115,7 @@ def test_investigation_returns_ai_response():
 
     mock_response = MagicMock()
     mock_response.__enter__.return_value.read.return_value = (
-        b'{"response": "Check database connectivity and logs."}'
+        json.dumps({"response": VALID_INVESTIGATION_RESPONSE}).encode()
     )
 
     with patch(
@@ -111,7 +128,7 @@ def test_investigation_returns_ai_response():
         )
 
     assert result["incident_id"] == 1
-    assert "database connectivity" in result["investigation"].lower()
+    assert "database connection timeouts" in result["investigation"].lower()
     assert result["retrieved_documents"] == []
 
 
@@ -140,7 +157,7 @@ def test_investigation_uses_retrieved_knowledge():
 
     mock_response = MagicMock()
     mock_response.__enter__.return_value.read.return_value = (
-        b'{"response": "Check connection pool usage and database logs."}'
+        json.dumps({"response": VALID_INVESTIGATION_RESPONSE}).encode()
     )
 
     with patch(

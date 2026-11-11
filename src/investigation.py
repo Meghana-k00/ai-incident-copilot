@@ -13,6 +13,55 @@ from src.retrieval import IncidentRetriever
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_INVESTIGATION_SECTIONS = [
+    "Evidence-supported observations:",
+    "Unverified root-cause hypotheses:",
+    "Recommended diagnostic checks:",
+    "Safe remediation suggestions:",
+    "Evidence gaps:",
+]
+
+
+def validate_investigation_output(answer: str) -> str:
+    """Validate the structure of an LLM-generated investigation."""
+
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("Investigation output cannot be empty.")
+
+    lines = [line.strip() for line in answer.strip().splitlines()]
+
+    headings = [
+        line for line in lines
+        if line.endswith(":")
+    ]
+
+    for heading in headings:
+        if heading not in REQUIRED_INVESTIGATION_SECTIONS:
+            raise ValueError(
+                f"Investigation output contains unexpected section: {heading}"
+            )
+
+    for section in REQUIRED_INVESTIGATION_SECTIONS:
+        count = headings.count(section)
+
+        if count == 0:
+            raise ValueError(
+                f"Investigation output is missing required section: {section}"
+            )
+
+        if count > 1:
+            raise ValueError(
+                f"Investigation output contains duplicate section: {section}"
+            )
+
+    if headings != REQUIRED_INVESTIGATION_SECTIONS:
+        raise ValueError(
+            "Investigation sections are not in the required order."
+        )
+
+    return answer.strip()
+
+
 class InvestigationState(TypedDict, total=False):
     incident: dict[str, Any]
     model: str
@@ -352,21 +401,25 @@ STRICT RULES:
 - If the incident says diagnostic information is unavailable,
   explicitly preserve that uncertainty.
 
+
 2. UNVERIFIED ROOT-CAUSE HYPOTHESES
 - Provide at most two hypotheses.
-- Each must be clearly labelled UNVERIFIED.
-- Each must be a possible explanation, not an established fact.
-- Only include hypotheses directly relevant to the reported symptoms.
-- Do not invent technical details to justify a hypothesis.
-- If there is insufficient information, state that no root cause
-  can currently be established.
-  - If the incident provides no specific technical symptoms,
-    error messages, or diagnostic evidence, do not generate hypotheses.
-- A general label such as "database incident" is not sufficient
-  evidence to suggest database load or configuration problems.
-- In that situation, explicitly state:
+- Every hypothesis must be supported by at least one specific
+  technical symptom or diagnostic observation in the current incident.
+- A symptom alone does not establish a root cause.
+- Do not introduce possible causes merely because they are common
+  explanations for the reported error.
+- Do not assume server overload, database failure, network failure,
+  configuration problems, or resource contention without relevant
+  evidence in the current incident.
+- Historical knowledge may help formulate a diagnostic check but
+  must not independently justify a current root-cause hypothesis.
+- If the current incident contains only an error code or general
+  availability symptom without supporting diagnostic evidence,
+  state exactly:
   "No root-cause hypotheses can be established from the
   available information."
+- If there is insufficient information, do not generate hypotheses.
 - Do not recommend scaling, configuration changes, or other
   remediation actions when no relevant technical cause
   has been established.
@@ -378,9 +431,20 @@ STRICT RULES:
 - Do not invent the results of any check.
 
 4. SAFE REMEDIATION SUGGESTIONS
-- Only provide conditional suggestions.
+- Only provide conditional remediation suggestions.
+- Every suggestion must be linked to a specific, evidence-supported
+  technical condition.
 - State the condition that must be verified before suggesting an action.
+- Do not recommend actions based only on generic assumptions about
+  common causes of HTTP errors.
+- Do not suggest restarting services, changing configurations,
+  modifying environment variables, scaling infrastructure, or
+  changing production resources unless the current incident contains
+  evidence supporting the relevant technical condition.
 - Do not recommend disruptive actions without human approval.
+- If no specific technical cause or supporting condition is established,
+  state exactly:
+  "No safe remediation suggestions can be provided without further evidence."
 - Do not imply that any remediation has already been executed.
 
 5. HISTORICAL KNOWLEDGE
@@ -424,13 +488,23 @@ Safe remediation suggestions:
 Evidence gaps:
 - ...
 
-FINAL VALIDATION:
-Before returning the investigation, check every observation:
-- Is it explicitly supported by the current incident or evidence?
-- Does it preserve the correct source of information?
-- Does it avoid adding an inferred technical cause?
+Before returning the answer, silently verify that it follows
+the required output format.
 
-If any answer is no, remove or rewrite that observation.
+The response MUST contain exactly these five section headings:
+Evidence-supported observations:
+Unverified root-cause hypotheses:
+Recommended diagnostic checks:
+Safe remediation suggestions:
+Evidence gaps:
+
+If no remediation is supported, still include the
+Safe remediation suggestions section and state:
+"No safe remediation suggestions can be provided without further evidence."
+
+Never print validation instructions, validation headings,
+or additional sections.
+
 """
 
     payload = json.dumps({
@@ -472,7 +546,7 @@ If any answer is no, remove or rewrite that observation.
     except urllib.error.URLError as exc:
         duration = time.perf_counter() - start_time
 
-        logger.exception(
+        logger.error(
             "Ollama connection failed | request_id=%s | "
             "incident_id=%s | model=%s | duration_seconds=%.3f",
             request_id,
@@ -547,6 +621,25 @@ If any answer is no, remove or rewrite that observation.
             "Ollama returned an empty or invalid investigation."
         )
 
+    try:
+        answer = validate_investigation_output(answer)
+
+    except ValueError:
+        duration = time.perf_counter() - start_time
+
+        logger.exception(
+            "Ollama investigation structure validation failed | "
+            "request_id=%s | incident_id=%s | model=%s | "
+            "duration_seconds=%.3f",
+            request_id,
+            incident_id,
+            model,
+            duration,
+        )
+
+        raise RuntimeError(
+            "Ollama returned an investigation with invalid section structure."
+        ) from None
     duration = time.perf_counter() - start_time
 
     logger.info(
