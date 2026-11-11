@@ -1,8 +1,10 @@
 import json
+import time
 import urllib.error
 import urllib.request
 
 from typing import Any
+
 
 
 DEFAULT_MODEL = "qwen2.5:3b"
@@ -121,7 +123,7 @@ def _validate_judgement(
             raise FaithfulnessEvaluationError(
                 f"Supported claim {index + 1} must reference evidence."
             )
-            
+
         if not isinstance(reason, str) or not reason.strip():
             raise FaithfulnessEvaluationError(
                 f"Claim {index + 1} has no explanation."
@@ -278,6 +280,11 @@ Rules:
 8. Use only the supplied evidence IDs.
 9. Do not invent evidence or claim that checks were performed.
 10. Evaluate every meaningful factual statement.
+11. Every claim MUST include a non-empty "reason" field.
+12. The reason must explain why the selected verdict is appropriate,
+    using only the supplied evidence.
+13. Never return a claim with a missing, empty, or null reason.
+
 
 MANDATORY CLAIM EXTRACTION PROCEDURE:
 
@@ -371,11 +378,13 @@ STRICT EVIDENCE MATCHING RULES:
    whether a claim is true or false.
 """
 
-    
+
     current_prompt = prompt
     judgement = None
 
+
     for attempt in range(2):
+        attempt_start = time.perf_counter()
         payload = json.dumps({
             "model": model,
             "prompt": current_prompt,
@@ -402,7 +411,6 @@ STRICT EVIDENCE MATCHING RULES:
                 ollama_result = json.loads(
                     http_response.read().decode("utf-8")
                 )
-
         except urllib.error.HTTPError as exc:
             raise FaithfulnessEvaluationError(
                 f"Ollama returned HTTP error {exc.code}."
@@ -418,12 +426,18 @@ STRICT EVIDENCE MATCHING RULES:
                 "Ollama returned an invalid response."
             ) from exc
 
+        print(
+            f"Faithfulness Ollama attempt {attempt + 1}: "
+            f"{time.perf_counter() - attempt_start:.2f} seconds"
+        )
+
         if not isinstance(ollama_result, dict):
             raise FaithfulnessEvaluationError(
                 "Ollama returned an unexpected response."
             )
 
         raw_judgement = ollama_result.get("response")
+
 
         if not isinstance(raw_judgement, str) or not raw_judgement.strip():
             raise FaithfulnessEvaluationError(
@@ -432,6 +446,7 @@ STRICT EVIDENCE MATCHING RULES:
 
         try:
             parsed_judgement = json.loads(raw_judgement)
+
         except json.JSONDecodeError as exc:
             raise FaithfulnessEvaluationError(
                 "The evaluator did not return valid JSON."
@@ -445,6 +460,10 @@ STRICT EVIDENCE MATCHING RULES:
             break
 
         except FaithfulnessEvaluationError as exc:
+            print(
+                f"Faithfulness validation attempt {attempt + 1} failed: {exc}"
+            )
+
             if attempt == 1:
                 raise
 

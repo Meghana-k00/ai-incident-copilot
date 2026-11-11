@@ -1,4 +1,5 @@
 import json
+import time
 
 from src.investigation import investigate_incident
 from src.retrieval import IncidentRetriever
@@ -65,10 +66,17 @@ def main():
     )
 
     print("\nRunning faithfulness evaluation...")
+    evaluation_start = time.perf_counter()
 
     evaluation = evaluate_faithfulness(
         response=investigation["investigation"],
         evidence=all_evidence,
+    )
+    evaluation_duration = time.perf_counter() - evaluation_start
+
+    print(
+        f"\nFaithfulness evaluation duration: "
+        f"{evaluation_duration:.2f} seconds"
     )
 
     print("\nFaithfulness evaluation result:")
