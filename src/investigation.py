@@ -514,6 +514,7 @@ or additional sections.
         "options": {
             "temperature": 0,
             "seed": 42,
+            "num_predict": 150,
         },
     }).encode("utf-8")
 
