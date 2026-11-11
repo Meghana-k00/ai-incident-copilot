@@ -6,12 +6,16 @@ import urllib.error
 import pytest
 
 
+
 from src.investigation import (
     prepare_investigation,
     prepare_incident_node,
     retrieve_knowledge_node,
     generate_investigation_node,
     validate_investigation_output,
+    classify_incident_request,
+    route_after_preparation,
+    handle_special_request_node,
 )
 
 VALID_INVESTIGATION_RESPONSE = """
@@ -691,3 +695,94 @@ Evidence gaps:
         match="duplicate section",
     ):
         validate_investigation_output(answer)
+
+
+def test_classify_vague_incident():
+    assert classify_incident_request("Something is wrong") == "insufficient_information"
+
+
+def test_classify_out_of_scope_request():
+    assert classify_incident_request("Suggest a holiday destination") == "out_of_scope"
+
+
+def test_classify_technical_incident():
+    assert classify_incident_request("Database connection timeout occurred") is None
+
+
+def test_route_special_request():
+    state = {
+        "context": {
+            "request_classification": "insufficient_information"
+        }
+    }
+    assert route_after_preparation(state) == "special_request"
+
+
+def test_route_normal_incident():
+    state = {
+        "context": {
+            "request_classification": None
+        }
+    }
+    assert route_after_preparation(state) == "retrieve_knowledge"
+
+
+def test_insufficient_information_skips_retrieval_and_ollama(monkeypatch):
+    from src.investigation import investigate_incident
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("Retrieval or Ollama should not be called")
+
+    monkeypatch.setattr(
+        "src.investigation.IncidentRetriever",
+        fail_if_called,
+    )
+
+    monkeypatch.setattr(
+        "src.investigation.urllib.request.urlopen",
+        fail_if_called,
+    )
+
+    incident = {
+        "id": "INC-TEST-001",
+        "title": "Unclear issue",
+        "description": "Something is wrong",
+        "severity": "low",
+        "service_name": "unknown-service",
+    }
+
+    result = investigate_incident(incident)
+
+    assert "investigation" in result
+    assert "Evidence gaps:" in result["investigation"]
+    assert "sufficient technical details" in result["investigation"]
+
+
+def test_out_of_scope_request_skips_retrieval_and_ollama(monkeypatch):
+    from src.investigation import investigate_incident
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("Retrieval or Ollama should not be called")
+
+    monkeypatch.setattr(
+        "src.investigation.IncidentRetriever",
+        fail_if_called,
+    )
+
+    monkeypatch.setattr(
+        "src.investigation.urllib.request.urlopen",
+        fail_if_called,
+    )
+
+    incident = {
+        "id": "INC-TEST-002",
+        "title": "Holiday recommendation",
+        "description": "Suggest a holiday destination",
+        "severity": "low",
+        "service_name": "unknown-service",
+    }
+
+    result = investigate_incident(incident)
+
+    assert "investigation" in result
+    assert "outside the scope" in result["investigation"]
