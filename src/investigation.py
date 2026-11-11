@@ -602,6 +602,22 @@ or additional sections.
             "Ollama returned an unexpected response format."
         )
 
+    logger.info(
+        "Ollama performance metrics | "
+        "model=%s | prompt_tokens=%s | "
+        "generation_tokens=%s | "
+        "load_duration_seconds=%.3f | "
+        "prompt_duration_seconds=%.3f | "
+        "generation_duration_seconds=%.3f | "
+        "total_duration_seconds=%.3f",
+        model,
+        result.get("prompt_eval_count", 0),
+        result.get("eval_count", 0),
+        result.get("load_duration", 0) / 1_000_000_000,
+        result.get("prompt_eval_duration", 0) / 1_000_000_000,
+        result.get("eval_duration", 0) / 1_000_000_000,
+        result.get("total_duration", 0) / 1_000_000_000,
+    )
     answer = result.get("response")
 
     if not isinstance(answer, str) or not answer.strip():
