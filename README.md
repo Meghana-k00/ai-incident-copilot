@@ -82,19 +82,28 @@ ai-incident-copilot/
 │   ├── models.py
 │   └── retrieval.py
 ├── tests/
-│   ├── __init__.py
 │   ├── test_approval_workflow.py
 │   ├── test_auth.py
+│   ├── test_evaluation_dataset.py
+│   ├── test_faithfulness.py
 │   ├── test_health.py
 │   ├── test_incident_endpoints.py
 │   ├── test_incidents.py
 │   ├── test_investigation.py
+│   ├── test_logging.py
 │   ├── test_main.py
 │   └── test_retrieval.py
 ├── evaluation/
+│   ├── datasets/
+│   │   └── incident_cases.json
+│   ├── faithfulness.py
 │   ├── run_evaluation.py
-│   └── test_investigation_quality.py
+│   ├── run_faithfulness.py
+│   ├── run_golden_dataset.py
+│   ├── test_investigation_quality.py
+│   └── validate_dataset.py
 ├── docs/
+│   └── database_incidents.md
 ├── data/
 ├── requirements.txt
 ├── .gitignore
@@ -284,12 +293,38 @@ A convenience runner is also available:
 ```bash
 python -m pytest evaluation/run_evaluation.py -v
 ```
+### Golden dataset evaluation
+
+Run the evaluation against the eligible cases in the incident dataset:
+
+```bash
+python evaluation/run_golden_dataset.py
+
+### Faithfulness evaluation
+
+Run the faithfulness evaluation:
+
+```bash
+python evaluation/run_faithfulness.py
 
 ### Verified development test result
 
-**112 tests passed** in the latest confirmed full test-suite run during development.
+**149 tests passed** in the latest confirmed full test-suite run during development.
 
 The test suite covers API behavior, incident validation, investigation logic, retrieval behavior, approval workflows, and failure-recovery scenarios.
+
+### Golden Dataset Evaluation
+
+The latest golden dataset evaluation completed successfully:
+
+- Dataset cases: 10
+- Evaluated cases: 7
+- Passed: 7
+- Failed: 0
+- Errors: 0
+- Pass rate among evaluated cases: 100%
+
+Three cases are excluded by the evaluation filtering rules.
 
 Tests use mocks for external model calls where appropriate. Passing automated tests therefore does not guarantee that every live model response will be accurate or that all external integrations will behave identically in production.
 

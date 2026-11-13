@@ -498,6 +498,16 @@ Recommended diagnostic checks:
 Safe remediation suggestions:
 Evidence gaps:
 
+CRITICAL FINAL-SECTION REQUIREMENT:
+- Evidence gaps MUST always be included.
+- Evidence gaps MUST be the final section.
+- Include at least one concise bullet under Evidence gaps.
+- If information is missing, explicitly identify what is unavailable.
+- If no additional evidence gaps exist, state that no further
+  evidence gaps were identified.
+- NEVER end the response after Safe remediation suggestions.
+- Complete all five sections before returning the answer.
+
 If no remediation is supported, still include the
 Safe remediation suggestions section and state:
 "No safe remediation suggestions can be provided without further evidence."
@@ -514,7 +524,7 @@ or additional sections.
         "options": {
             "temperature": 0,
             "seed": 42,
-            "num_predict": 150,
+            "num_predict": 220,
         },
     }).encode("utf-8")
 
@@ -606,7 +616,7 @@ or additional sections.
     logger.info(
         "Ollama performance metrics | "
         "model=%s | prompt_tokens=%s | "
-        "generation_tokens=%s | "
+        "generation_tokens=%s | done_reason=%s | "
         "load_duration_seconds=%.3f | "
         "prompt_duration_seconds=%.3f | "
         "generation_duration_seconds=%.3f | "
@@ -614,6 +624,7 @@ or additional sections.
         model,
         result.get("prompt_eval_count", 0),
         result.get("eval_count", 0),
+        result.get("done_reason", "unknown"),
         result.get("load_duration", 0) / 1_000_000_000,
         result.get("prompt_eval_duration", 0) / 1_000_000_000,
         result.get("eval_duration", 0) / 1_000_000_000,
